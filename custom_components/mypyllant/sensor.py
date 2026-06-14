@@ -4,6 +4,14 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+    async_add_external_statistics,
+    get_last_statistics,
+)
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -50,7 +58,7 @@ async def create_system_sensors(
         "system_coordinator"
     ]
     if not system_coordinator.data:
-        _LOGGER.warning("No system data, skipping sensors")
+        _LOGGER.debug("No system data, skipping sensors")
         return EntityList()
 
     sensors: EntityList[SensorEntity] = EntityList()
@@ -403,6 +411,7 @@ class SystemWaterPressureSensor(SystemSensor):
 
 class HomeEntity(CoordinatorEntity, SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    coordinator: SystemCoordinator
 
     def __init__(
         self,
@@ -689,7 +698,16 @@ class CircuitStateSensor(CircuitSensor):
 
     @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
-        return prepare_field_value_for_dict(self.circuit.extra_fields)
+        # heating_circuit_flow_setpoint was previously surfaced via extra_fields
+        # but was promoted to a typed Circuit field upstream (see #422, #440).
+        # Merge it back in explicitly so existing automations/templates reading
+        # state_attr('sensor.<>_circuit_0_state', 'heating_circuit_flow_setpoint')
+        # keep working. prepare_field_value_for_dict must still run on
+        # extra_fields because it contains a zoneinfo.ZoneInfo value that is
+        # not JSON-serialisable raw.
+        return prepare_field_value_for_dict(self.circuit.extra_fields) | {
+            "heating_circuit_flow_setpoint": self.circuit.heating_circuit_flow_setpoint,
+        }
 
     @property
     def unique_id(self) -> str:
@@ -833,6 +851,11 @@ class DataSensor(CoordinatorEntity, SensorEntity):
             self.unique_id,
         )
 
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self.coordinator.data:
+            await self._safe_write_hourly_statistics()
+
     @property
     def name(self):
         if self.device_data is None:
@@ -916,6 +939,106 @@ class DataSensor(CoordinatorEntity, SensorEntity):
             self.native_value,
             self.last_reset,
             self.device_data.data if self.device_data is not None else None,
+        )
+        self.hass.async_create_task(self._safe_write_hourly_statistics())
+
+    async def _safe_write_hourly_statistics(self) -> None:
+        try:
+            await self._write_hourly_statistics()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Failed to write hourly statistics for %s; will retry on next update",
+                self.unique_id,
+                exc_info=True,
+            )
+
+    async def _write_hourly_statistics(self) -> None:
+        if (
+            self.unique_id is None
+            or self.device_data is None
+            or not self.device_data.data
+        ):
+            return
+        statistic_id = f"{DOMAIN}:{self.unique_id}".lower().replace("-", "_")
+
+        # Derive the day start from the API's data_from when available, otherwise from the
+        # first bucket's own timestamp floored to midnight. The myVAILLANT API does not
+        # always return `from`, and depending on it caused statistics to silently stop
+        # writing. Mirrors octopus_energy, which derives the period start from
+        # consumptions[0]["start"].replace(minute=0, second=0, microsecond=0).
+        day_start = self.device_data.data_from or self.device_data.data[
+            0
+        ].start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        _LOGGER.debug(
+            "Writing hourly statistics for %s: %d buckets, data_from=%s, day_start=%s",
+            self.unique_id,
+            len(self.device_data.data),
+            self.device_data.data_from,
+            day_start,
+        )
+
+        # Carry forward the previous running total so statistics are always
+        # monotonically increasing across day boundaries.  Without this, sum
+        # resets to 0 each day and HA computes sum(T) - sum(T-1) = -3804 Wh at
+        # the BST midnight boundary.  Uses get_last_statistics (1 row, no time
+        # window) so the baseline is always found regardless of how long the
+        # integration has been inactive.
+        last_stats = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            statistic_id,
+            False,
+            {"sum"},
+        )
+        baseline_sum = (
+            last_stats[statistic_id][-1]["sum"] or 0.0
+            if statistic_id in last_stats and last_stats[statistic_id]
+            else 0.0
+        )
+
+        # The coordinator fetches a 2-day window (yesterday + today) so the previous
+        # day's final hour is backfilled once it finalises after midnight. The buckets
+        # therefore span day boundaries: sum stays monotonic (cumulative since baseline),
+        # while state and last_reset reset to the start of each day, mirroring
+        # octopus_energy's day-cumulative state.
+        running_sum = baseline_sum
+        running_state = 0.0
+        current_day = None
+        stats: list[StatisticData] = []
+        for bucket in self.device_data.data:
+            if bucket.value is None:
+                continue
+            bucket_midnight = bucket.start_date.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            if current_day != bucket_midnight:
+                running_state = 0.0
+                current_day = bucket_midnight
+            running_sum += bucket.value
+            running_state += bucket.value
+            stats.append(
+                StatisticData(
+                    start=bucket.start_date,
+                    last_reset=bucket_midnight,
+                    sum=running_sum,
+                    state=running_state,
+                )
+            )
+        if not stats:
+            return
+        async_add_external_statistics(
+            self.hass,
+            StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=self.name,
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class="energy",
+                unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+            ),
+            stats,
         )
 
 
