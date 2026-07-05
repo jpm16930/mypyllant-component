@@ -11,6 +11,7 @@ from homeassistant.components.recorder.statistics import (
     StatisticMeanType,
     StatisticMetaData,
     async_add_external_statistics,
+    get_last_statistics,
     statistics_during_period,
 )
 from homeassistant.components.sensor import (
@@ -987,52 +988,53 @@ class DataSensor(CoordinatorEntity, SensorEntity):
             return
         statistic_id = f"{DOMAIN}:{self.unique_id}".lower().replace("-", "_")
 
-        # Derive the day start from the API's data_from when available, otherwise from the
-        # first bucket's own timestamp floored to midnight. The myVAILLANT API does not
-        # always return `from`, and depending on it caused statistics to silently stop
-        # writing. Mirrors octopus_energy, which derives the period start from
-        # consumptions[0]["start"].replace(minute=0, second=0, microsecond=0).
-        day_start = self.device_data.data_from or self.device_data.data[
-            0
-        ].start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        _LOGGER.debug(
-            "Writing hourly statistics for %s: %d buckets, data_from=%s, day_start=%s",
-            self.unique_id,
-            len(self.device_data.data),
-            self.device_data.data_from,
-            day_start,
+        window_start = self.device_data.data[0].start_date
+        window_end = self.device_data.data[-1].start_date + timedelta(hours=1)
+
+        # Baseline is the true last-published sum before this window, never a stat
+        # recomputed from a rewrite of the window itself. This is what keeps `sum`
+        # append-only history instead of a value that drifts every time the window
+        # is rebuilt.
+        last_stats = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics,
+            self.hass,
+            1,
+            statistic_id,
+            True,
+            {"sum"},
+        )
+        baseline_sum = (
+            last_stats[statistic_id][0]["sum"] or 0.0
+            if statistic_id in last_stats and last_stats[statistic_id]
+            else 0.0
         )
 
-        # Carry forward the running total from just before the data window so that
-        # statistics are always monotonically increasing across day boundaries and
-        # across HA restarts. Mirrors octopus_energy's async_get_last_sum pattern:
-        # query statistics_during_period with end=window_start so the baseline is
-        # always the last recorded stat BEFORE the current window, never a stat
-        # inside it. This means the window can be freely rewritten on every run
-        # (correcting late API updates) without creating a phantom spike at the
-        # window boundary.
-        window_start = self.device_data.data[0].start_date
-        last_stats = await get_instance(self.hass).async_add_executor_job(
+        # Buckets already published for this window, keyed by start timestamp, so we
+        # only (re)write buckets that are new or whose value actually changed (a
+        # late API correction) - not every bucket on every run. Rewriting the whole
+        # window unconditionally re-anchors already-published, stable history to
+        # whatever baseline happens to be current, which breaks the daily reset.
+        existing_stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
-            window_start - timedelta(days=7),
             window_start,
+            window_end,
             {statistic_id},
             "hour",
             None,
             {"sum"},
         )
-        baseline_sum = (
-            last_stats[statistic_id][-1]["sum"] or 0.0
-            if statistic_id in last_stats and last_stats[statistic_id]
-            else 0.0
-        )
+        existing_sums = {
+            row["start"]: row["sum"]
+            for row in existing_stats.get(statistic_id, [])
+            if "start" in row
+        }
 
         # The coordinator fetches a 2-day window (yesterday + today) so the previous
-        # day's final hour is backfilled once it finalises after midnight. The buckets
-        # therefore span day boundaries: sum stays monotonic (cumulative since baseline),
-        # while state and last_reset reset to the start of each day, mirroring
-        # octopus_energy's day-cumulative state.
+        # day's final hour can still be backfilled once it finalises after midnight.
+        # sum stays monotonic (cumulative since baseline), while state and last_reset
+        # reset to the start of each day, mirroring octopus_energy's day-cumulative
+        # state.
         running_sum = baseline_sum
         running_state = 0.0
         current_day = None
@@ -1048,6 +1050,9 @@ class DataSensor(CoordinatorEntity, SensorEntity):
                 current_day = bucket_midnight
             running_sum += bucket.value
             running_state += bucket.value
+            existing_sum = existing_sums.get(bucket.start_date.timestamp())
+            if existing_sum is not None and existing_sum == running_sum:
+                continue
             stats.append(
                 StatisticData(
                     start=bucket.start_date,

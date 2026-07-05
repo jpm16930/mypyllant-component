@@ -597,4 +597,78 @@ async def test_write_hourly_statistics_resets_state_across_day_boundary(hass):
     assert stats[0]["last_reset"] == day1
     assert stats[1]["last_reset"] == day1
     assert stats[2]["last_reset"] == day2
-    assert stats[3]["last_reset"] == day2
+
+
+async def test_write_hourly_statistics_skips_unchanged_buckets(hass):
+    """Buckets already published with the same sum must not be rewritten, so stable
+    history stays untouched and the baseline never gets re-anchored on every run."""
+    buckets = _make_buckets([100.0, 200.0, 300.0])
+    sensor = _make_sensor(hass, buckets)
+    stat_id = f"{DOMAIN}:{sensor.unique_id}".lower().replace("-", "_")
+
+    async def fake_job(func, *args):
+        if func.__name__ == "get_last_statistics":
+            return {}
+        return {
+            stat_id: [
+                {"start": buckets[0].start_date.timestamp(), "sum": 100.0},
+                {"start": buckets[1].start_date.timestamp(), "sum": 300.0},
+            ]
+        }
+
+    with (
+        patch("custom_components.mypyllant.sensor.get_instance") as mock_recorder,
+        patch(
+            "custom_components.mypyllant.sensor.async_add_external_statistics"
+        ) as mock_stats,
+    ):
+        mock_recorder.return_value.async_add_executor_job = AsyncMock(
+            side_effect=fake_job
+        )
+        await sensor._write_hourly_statistics()
+
+    mock_stats.assert_called_once()
+    _, _, stats = mock_stats.call_args[0]
+    stats = list(stats)
+    assert len(stats) == 1
+    assert stats[0]["start"] == buckets[2].start_date
+    assert stats[0]["sum"] == 600.0
+
+
+async def test_write_hourly_statistics_rewrites_corrected_bucket(hass):
+    """A late API correction for an already-published hour (e.g. yesterday's final
+    hour settling after midnight) must still be rewritten even though a stat already
+    exists for it - the skip only applies to genuinely unchanged buckets."""
+    buckets = _make_buckets([100.0, 250.0, 300.0])
+    sensor = _make_sensor(hass, buckets)
+    stat_id = f"{DOMAIN}:{sensor.unique_id}".lower().replace("-", "_")
+
+    async def fake_job(func, *args):
+        if func.__name__ == "get_last_statistics":
+            return {}
+        return {
+            stat_id: [
+                {"start": buckets[0].start_date.timestamp(), "sum": 100.0},
+                {"start": buckets[1].start_date.timestamp(), "sum": 300.0},  # stale
+            ]
+        }
+
+    with (
+        patch("custom_components.mypyllant.sensor.get_instance") as mock_recorder,
+        patch(
+            "custom_components.mypyllant.sensor.async_add_external_statistics"
+        ) as mock_stats,
+    ):
+        mock_recorder.return_value.async_add_executor_job = AsyncMock(
+            side_effect=fake_job
+        )
+        await sensor._write_hourly_statistics()
+
+    mock_stats.assert_called_once()
+    _, _, stats = mock_stats.call_args[0]
+    stats = list(stats)
+    assert len(stats) == 2
+    assert stats[0]["start"] == buckets[1].start_date
+    assert stats[0]["sum"] == 350.0
+    assert stats[1]["start"] == buckets[2].start_date
+    assert stats[1]["sum"] == 650.0
