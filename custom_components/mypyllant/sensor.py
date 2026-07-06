@@ -925,6 +925,29 @@ class DataSensor(CoordinatorEntity, SensorEntity):
         return self.device_data.total_consumption_rounded
 
     @property
+    def today_total_consumption(self) -> float:
+        # The coordinator fetches a 2-day window (yesterday + today) so
+        # _write_hourly_statistics can backfill yesterday's last hour after
+        # midnight (see coordinator.py). device_data.total_consumption is the
+        # API's own aggregate for that whole 2-day range, so it can't be used
+        # here - it would never reset to 0 at midnight. Sum only today's own
+        # buckets instead, using the same bucket-midnight comparison
+        # _write_hourly_statistics already uses, so the two stay consistent.
+        if self.device_data is None or not self.device_data.data:
+            return 0.0
+        today = self.device_data.data[-1].start_date.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        total = sum(
+            bucket.value
+            for bucket in self.device_data.data
+            if bucket.value is not None
+            and bucket.start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            == today
+        )
+        return round(total / 1000, 1) * 1000 if total else 0.0
+
+    @property
     def unique_id(self) -> str | None:
         if self.device is None:
             return None
@@ -953,7 +976,7 @@ class DataSensor(CoordinatorEntity, SensorEntity):
     @property
     def native_value(self):
         if self.device_data:
-            return self.device_data.total_consumption_rounded
+            return self.today_total_consumption
         else:
             return None
 

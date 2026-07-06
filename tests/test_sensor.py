@@ -672,3 +672,53 @@ async def test_write_hourly_statistics_rewrites_corrected_bucket(hass):
     assert stats[0]["sum"] == 350.0
     assert stats[1]["start"] == buckets[2].start_date
     assert stats[1]["sum"] == 650.0
+
+
+def test_today_total_consumption_ignores_yesterdays_buckets(hass):
+    """The coordinator fetches a 2-day window (yesterday + today) so
+    _write_hourly_statistics can backfill yesterday's last hour. native_value
+    must not inherit yesterday's total from that wider window - it should
+    reset to only today's consumption, the same way the History graph is
+    expected to reset at midnight."""
+    day1 = datetime(2026, 5, 27, 0, 0, tzinfo=timezone.utc)
+    day2 = datetime(2026, 5, 28, 0, 0, tzinfo=timezone.utc)
+    buckets = [
+        DeviceDataBucket(
+            start_date=day1 + timedelta(hours=22),
+            end_date=day1 + timedelta(hours=23),
+            value=100.0,
+        ),
+        DeviceDataBucket(
+            start_date=day1 + timedelta(hours=23),
+            end_date=day2,
+            value=200.0,
+        ),
+        DeviceDataBucket(
+            start_date=day2,
+            end_date=day2 + timedelta(hours=1),
+            value=300.0,
+        ),
+        DeviceDataBucket(
+            start_date=day2 + timedelta(hours=1),
+            end_date=day2 + timedelta(hours=2),
+            value=400.0,
+        ),
+    ]
+    sensor = _make_sensor(hass, buckets, data_from=day1)
+
+    # today_total_consumption only sums day2's buckets (300 + 400), not the
+    # full 2-day window (100 + 200 + 300 + 400 = 1000)
+    assert sensor.today_total_consumption == 700.0
+    assert sensor.native_value == 700.0
+    assert sensor.native_value != sensor.device_data.total_consumption_rounded
+
+
+def test_today_total_consumption_no_data(hass):
+    sensor = _make_sensor(hass, [])
+    assert sensor.today_total_consumption == 0.0
+
+
+def test_today_total_consumption_all_none_values(hass):
+    buckets = _make_buckets([None, None])
+    sensor = _make_sensor(hass, buckets)
+    assert sensor.today_total_consumption == 0.0
