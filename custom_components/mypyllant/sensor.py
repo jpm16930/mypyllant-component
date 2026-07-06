@@ -994,13 +994,16 @@ class DataSensor(CoordinatorEntity, SensorEntity):
         # Baseline is the true last-published sum before this window, never a stat
         # recomputed from a rewrite of the window itself. This is what keeps `sum`
         # append-only history instead of a value that drifts every time the window
-        # is rebuilt.
+        # is rebuilt. convert_units=False so the baseline stays in the sensor's
+        # native Wh regardless of the user's display unit preference - True would
+        # return the baseline in kWh (e.g. for an energy-unit-preference of kWh)
+        # while bucket values are summed in Wh, corrupting the running sum 1000x.
         last_stats = await get_instance(self.hass).async_add_executor_job(
             get_last_statistics,
             self.hass,
             1,
             statistic_id,
-            True,
+            False,
             {"sum"},
         )
         baseline_sum = (
