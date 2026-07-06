@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.recorder import get_instance
@@ -933,11 +933,16 @@ class DataSensor(CoordinatorEntity, SensorEntity):
         # here - it would never reset to 0 at midnight. Sum only today's own
         # buckets instead, using the same bucket-midnight comparison
         # _write_hourly_statistics already uses, so the two stay consistent.
+        #
+        # "Today" is anchored to the actual current time in the device's own
+        # timezone, not to the last fetched bucket's date: right after
+        # midnight the API can briefly lag behind and not yet have a bucket
+        # for the new day, so data[-1] would still be yesterday, causing this
+        # to sum yesterday's total again instead of resetting to 0.
         if self.device_data is None or not self.device_data.data:
             return 0.0
-        today = self.device_data.data[-1].start_date.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+        tzinfo = self.device_data.data[-1].start_date.tzinfo
+        today = datetime.now(tzinfo).replace(hour=0, minute=0, second=0, microsecond=0)
         total = sum(
             bucket.value
             for bucket in self.device_data.data

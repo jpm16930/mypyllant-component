@@ -706,11 +706,45 @@ def test_today_total_consumption_ignores_yesterdays_buckets(hass):
     ]
     sensor = _make_sensor(hass, buckets, data_from=day1)
 
-    # today_total_consumption only sums day2's buckets (300 + 400), not the
-    # full 2-day window (100 + 200 + 300 + 400 = 1000)
-    assert sensor.today_total_consumption == 700.0
-    assert sensor.native_value == 700.0
-    assert sensor.native_value != sensor.device_data.total_consumption_rounded
+    with patch("custom_components.mypyllant.sensor.datetime") as mock_datetime:
+        mock_datetime.now.return_value = day2 + timedelta(hours=2)
+
+        # today_total_consumption only sums day2's buckets (300 + 400), not
+        # the full 2-day window (100 + 200 + 300 + 400 = 1000)
+        assert sensor.today_total_consumption == 700.0
+        assert sensor.native_value == 700.0
+        assert sensor.native_value != sensor.device_data.total_consumption_rounded
+
+
+def test_today_total_consumption_survives_api_bucket_lag_at_midnight(hass):
+    """Regression test: right after midnight the myVAILLANT API can briefly
+    lag and not yet return a bucket for the new day, so the last fetched
+    bucket is still dated yesterday. today_total_consumption must anchor
+    "today" to the actual current time, not to data[-1]'s date, or it would
+    wrongly sum yesterday's total again instead of resetting to 0."""
+    day1 = datetime(2026, 5, 27, 0, 0, tzinfo=timezone.utc)
+    day2 = datetime(2026, 5, 28, 0, 0, tzinfo=timezone.utc)
+    buckets = [
+        DeviceDataBucket(
+            start_date=day1 + timedelta(hours=22),
+            end_date=day1 + timedelta(hours=23),
+            value=100.0,
+        ),
+        DeviceDataBucket(
+            start_date=day1 + timedelta(hours=23),
+            end_date=day2,
+            value=200.0,
+        ),
+    ]
+    sensor = _make_sensor(hass, buckets, data_from=day1)
+
+    with patch("custom_components.mypyllant.sensor.datetime") as mock_datetime:
+        # "now" is already a few minutes into day2, but the API's last
+        # bucket is still dated day1 (23:00-00:00)
+        mock_datetime.now.return_value = day2 + timedelta(minutes=5)
+
+        assert sensor.today_total_consumption == 0.0
+        assert sensor.native_value == 0.0
 
 
 def test_today_total_consumption_no_data(hass):
@@ -720,5 +754,7 @@ def test_today_total_consumption_no_data(hass):
 
 def test_today_total_consumption_all_none_values(hass):
     buckets = _make_buckets([None, None])
-    sensor = _make_sensor(hass, buckets)
-    assert sensor.today_total_consumption == 0.0
+    with patch("custom_components.mypyllant.sensor.datetime") as mock_datetime:
+        mock_datetime.now.return_value = _MIDNIGHT + timedelta(hours=1)
+        sensor = _make_sensor(hass, buckets)
+        assert sensor.today_total_consumption == 0.0
