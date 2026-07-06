@@ -606,8 +606,9 @@ async def test_write_hourly_statistics_skips_unchanged_buckets(hass):
     sensor = _make_sensor(hass, buckets)
     stat_id = f"{DOMAIN}:{sensor.unique_id}".lower().replace("-", "_")
 
-    async def fake_job(func, *args):
-        if func.__name__ == "get_last_statistics":
+    async def fake_job(func, hass, start_time, *rest):
+        if start_time < buckets[0].start_date:
+            # baseline lookup (window_start - 7 days .. window_start)
             return {}
         return {
             stat_id: [
@@ -643,8 +644,9 @@ async def test_write_hourly_statistics_rewrites_corrected_bucket(hass):
     sensor = _make_sensor(hass, buckets)
     stat_id = f"{DOMAIN}:{sensor.unique_id}".lower().replace("-", "_")
 
-    async def fake_job(func, *args):
-        if func.__name__ == "get_last_statistics":
+    async def fake_job(func, hass, start_time, *rest):
+        if start_time < buckets[0].start_date:
+            # baseline lookup (window_start - 7 days .. window_start)
             return {}
         return {
             stat_id: [
@@ -672,6 +674,54 @@ async def test_write_hourly_statistics_rewrites_corrected_bucket(hass):
     assert stats[0]["sum"] == 350.0
     assert stats[1]["start"] == buckets[2].start_date
     assert stats[1]["sum"] == 650.0
+
+
+async def test_write_hourly_statistics_baseline_stable_across_repeated_polls(hass):
+    """Regression test: baseline must be the last-published sum strictly BEFORE
+    this window, not the single most-recent stat ever recorded. An unbounded
+    "latest ever" lookup returns this same run's own previous output on the
+    next poll, so baseline + sum(window's buckets) double-counts the window
+    every time and `sum` grows on every single poll forever, even though
+    nothing about the underlying consumption changed."""
+    buckets = _make_buckets([100.0, 200.0, 300.0])
+    sensor = _make_sensor(hass, buckets)
+    stat_id = f"{DOMAIN}:{sensor.unique_id}".lower().replace("-", "_")
+
+    published: dict = {}
+
+    async def fake_job(func, hass, start_time, *rest):
+        if start_time < buckets[0].start_date:
+            # baseline lookup: nothing published before this window in this test
+            return {}
+        # existing-stats lookup: reflects whatever the previous poll wrote
+        return {stat_id: published.get(stat_id, [])}
+
+    with (
+        patch("custom_components.mypyllant.sensor.get_instance") as mock_recorder,
+        patch(
+            "custom_components.mypyllant.sensor.async_add_external_statistics"
+        ) as mock_stats,
+    ):
+        mock_recorder.return_value.async_add_executor_job = AsyncMock(
+            side_effect=fake_job
+        )
+
+        # first poll: writes all three buckets
+        await sensor._write_hourly_statistics()
+        _, _, first_stats = mock_stats.call_args[0]
+        first_stats = list(first_stats)
+        published[stat_id] = [
+            {"start": s["start"].timestamp(), "sum": s["sum"]} for s in first_stats
+        ]
+        assert [s["sum"] for s in first_stats] == [100.0, 300.0, 600.0]
+
+        # second poll: identical bucket data, nothing should have changed
+        mock_stats.reset_mock()
+        await sensor._write_hourly_statistics()
+
+    # everything was already published with matching sums, so nothing new
+    # gets written - the sums must not have grown
+    mock_stats.assert_not_called()
 
 
 def test_today_total_consumption_ignores_yesterdays_buckets(hass):

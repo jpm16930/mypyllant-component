@@ -11,7 +11,6 @@ from homeassistant.components.recorder.statistics import (
     StatisticMeanType,
     StatisticMetaData,
     async_add_external_statistics,
-    get_last_statistics,
     statistics_during_period,
 )
 from homeassistant.components.sensor import (
@@ -1019,23 +1018,27 @@ class DataSensor(CoordinatorEntity, SensorEntity):
         window_start = self.device_data.data[0].start_date
         window_end = self.device_data.data[-1].start_date + timedelta(hours=1)
 
-        # Baseline is the true last-published sum before this window, never a stat
-        # recomputed from a rewrite of the window itself. This is what keeps `sum`
-        # append-only history instead of a value that drifts every time the window
-        # is rebuilt. convert_units=False so the baseline stays in the sensor's
-        # native Wh regardless of the user's display unit preference - True would
-        # return the baseline in kWh (e.g. for an energy-unit-preference of kWh)
-        # while bucket values are summed in Wh, corrupting the running sum 1000x.
+        # Baseline is the last-published sum strictly BEFORE this window, never the
+        # single most-recent stat ever recorded. get_last_statistics(1, ...) is
+        # unbounded - once any later window has been written, it returns a value
+        # that already includes this window's own buckets, so recomputing
+        # baseline + sum(this window's buckets) double-counts them and the sum
+        # grows on every single poll forever. Bounding the lookup to end at
+        # window_start keeps the baseline stable across repeated polls of the
+        # same window, so the existing-buckets dedup guard below can actually
+        # recognize unchanged buckets instead of rewriting everything every time.
         last_stats = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics,
+            statistics_during_period,
             self.hass,
-            1,
-            statistic_id,
-            False,
+            window_start - timedelta(days=7),
+            window_start,
+            {statistic_id},
+            "hour",
+            None,
             {"sum"},
         )
         baseline_sum = (
-            last_stats[statistic_id][0]["sum"] or 0.0
+            last_stats[statistic_id][-1]["sum"] or 0.0
             if statistic_id in last_stats and last_stats[statistic_id]
             else 0.0
         )
